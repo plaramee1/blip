@@ -1,0 +1,52 @@
+{
+  "event_name": "issues",
+  "labels": [
+    "accessibility",
+    "bug",
+    "duplicate",
+    "question",
+    "wontfix",
+    "feature",
+    "needs-info",
+    "accepted",
+    "triaged",
+    "fixed",
+    "area/chat",
+    "area/crew",
+    "area/design",
+    "area/memory",
+    "area/remote",
+    "area/updates",
+    "area/backends",
+    "area/terminal",
+    "area/wiki"
+  ],
+  "comments": [],
+  "event": {
+    "action": "opened",
+    "issue": {
+      "number": 102,
+      "title": "Let a crew worker run on a different model than the coordinator",
+      "body": "### What would you like?\n\nWhen I start a crew I'd like to pick the model for each worker, e.g. a cheap model for search tasks and a strong one for the hard edits. Right now every worker seems to inherit the coordinator's model.\n\n### Why?\n\nCost — most crew tasks are simple.",
+      "state": "open",
+      "author_association": "NONE",
+      "user": {
+        "login": "reporter-b",
+        "type": "User"
+      },
+      "labels": [
+        {
+          "name": "feature"
+        }
+      ]
+    }
+  },
+  "candidates": [
+    {
+      "number": 61,
+      "state": "open",
+      "title": "Crew board should show which model each worker used",
+      "body": "It would be nice to see the model per task on the board."
+    }
+  ]
+}

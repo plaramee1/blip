@@ -1,0 +1,51 @@
+name: Mirror accepted issues
+
+# When an issue is labelled `accepted`, open a linked issue in the private
+# tracker. Inert until both the MIRROR_TOKEN secret and the MIRROR_REPO
+# variable exist — see .github/TRIAGE.md.
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.event.label.name == 'accepted' && !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+      MIRROR_REPO: ${{ vars.MIRROR_REPO }}
+    steps:
+      - name: Check configuration
+        id: config
+        run: |
+          if [ -n "$MIRROR_TOKEN" ] && [ -n "$MIRROR_REPO" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Mirroring is not configured (MIRROR_TOKEN secret / MIRROR_REPO variable); skipping."
+          fi
+      - name: Open the private issue
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+          PUBLIC_URL: ${{ github.event.issue.html_url }}
+          PUBLIC_TITLE: ${{ github.event.issue.title }}
+          PUBLIC_BODY: ${{ github.event.issue.body }}
+        run: |
+          # Idempotent: a re-label must not open a second issue.
+          existing=$(gh issue list --repo "$MIRROR_REPO" --state all --search "\"$PUBLIC_URL\" in:body" --json number --jq 'length')
+          if [ "$existing" != "0" ]; then
+            echo "Already mirrored; nothing to do."
+            exit 0
+          fi
+          body=$(printf 'Mirrored from the public board: %s\n\n---\n\n%s\n' "$PUBLIC_URL" "$PUBLIC_BODY")
+          gh issue create --repo "$MIRROR_REPO" --title "$PUBLIC_TITLE" --body "$body" > /dev/null
+          echo "Mirrored."

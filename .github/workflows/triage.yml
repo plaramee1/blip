@@ -1,0 +1,51 @@
+name: Triage
+
+# Labels new issues, asks once for missing bug details, and points at likely
+# duplicates. Rules and secrets: .github/TRIAGE.md. The model only classifies;
+# .github/triage/triage.py decides every label and comment.
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per issue at a time; a newer event for the same issue waits.
+  group: triage-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    # Issues only (not PRs); for comments, only the author answering needs-info.
+    if: >-
+      !github.event.issue.pull_request &&
+      github.event.issue.state == 'open' &&
+      (github.event_name == 'issues' ||
+       (github.event.comment.user.login == github.event.issue.user.login &&
+        contains(github.event.issue.labels.*.name, 'needs-info')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/triage
+          persist-credentials: false
+      - name: Triage
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          TRIAGE_MODEL: ${{ vars.TRIAGE_MODEL }}
+          TRIAGE_DAILY_LIMIT: ${{ vars.TRIAGE_DAILY_LIMIT }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::notice::ANTHROPIC_API_KEY is not set; skipping triage."
+            exit 0
+          fi
+          python3 .github/triage/triage.py
