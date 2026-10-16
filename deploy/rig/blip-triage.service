@@ -1,0 +1,11 @@
+[Unit]
+Description=Triage new issues on plaramee1/blip with a local Ollama model
+After=ollama.service
+Wants=ollama.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/blip-triage/env
+ExecStart=/usr/bin/python3 %h/.local/share/blip-triage/triage.py poll --repo plaramee1/blip
+TimeoutStartSec=15min
+NoNewPrivileges=yes

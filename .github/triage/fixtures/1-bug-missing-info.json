@@ -1,0 +1,58 @@
+{
+  "event_name": "issues",
+  "labels": [
+    "accessibility",
+    "bug",
+    "duplicate",
+    "question",
+    "wontfix",
+    "feature",
+    "needs-info",
+    "accepted",
+    "triaged",
+    "fixed",
+    "area/chat",
+    "area/crew",
+    "area/design",
+    "area/memory",
+    "area/remote",
+    "area/updates",
+    "area/backends",
+    "area/terminal",
+    "area/wiki"
+  ],
+  "comments": [],
+  "event": {
+    "action": "opened",
+    "issue": {
+      "number": 101,
+      "title": "App freezes when I switch conversations",
+      "body": "### What happened?\n\nThe whole window freezes for about ten seconds whenever I switch to another conversation in the sidebar, then it recovers.\n\n### Steps to reproduce\n\n1. Open …\n2. Click …\n3. See …\n\n### Blip version\n\nnot sure\n\n### macOS version and Mac\n\nmacOS 27.0 · MacBook Air M3\n\n### Agent backend (if it matters)\n\nClaude Code",
+      "state": "open",
+      "author_association": "NONE",
+      "user": {
+        "login": "reporter-a",
+        "type": "User"
+      },
+      "labels": [
+        {
+          "name": "bug"
+        }
+      ]
+    }
+  },
+  "candidates": [
+    {
+      "number": 42,
+      "state": "closed",
+      "title": "Sidebar beach-balls when switching between long conversations",
+      "body": "Switching to a conversation with a long history hangs the UI for several seconds. Fixed in 0.88."
+    },
+    {
+      "number": 57,
+      "state": "open",
+      "title": "Conversation list does not scroll to the selected item",
+      "body": "After selecting a conversation the sidebar scroll position jumps to the top."
+    }
+  ]
+}
