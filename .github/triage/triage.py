@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Triage one issue event on this repository.
+"""Triage this repository's issues from a machine that polls them.
+
+Nothing runs in GitHub Actions: a timer on a maintainer's machine runs
+`triage.py poll`, which reads new and edited issues over the REST API, asks a
+local Ollama model to classify each one, and applies the result. See
+.github/TRIAGE.md for setup.
 
 The model only classifies (see prompt.md). Everything it may change is decided
 here, so the rules hold whatever the issue text says:
@@ -13,12 +18,13 @@ here, so the rules hold whatever the issue text says:
 
 Standard library only. Usage:
 
-    triage.py                       # in Actions: reads GITHUB_EVENT_PATH etc.
-    triage.py --fixture F.json      # offline dry run, prints the plan
-    triage.py --fixture F.json --engine claude-cli   # dry run without an API key
+    triage.py poll --repo OWNER/NAME [--dry-run]   # the timer runs this
+    triage.py --fixture F.json                      # offline dry run, prints the plan
+    triage.py --fixture F.json --engine claude-cli  # same, through the Claude Code CLI
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -27,7 +33,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -36,6 +42,7 @@ MISSING = ("version", "macos", "steps")
 INSIDERS = {"OWNER", "MEMBER", "COLLABORATOR"}
 MARK_NEEDS_INFO = "<!-- blip-triage:needs-info -->"
 MARK_DUPLICATES = "<!-- blip-triage:duplicates -->"
+MARK_MIRROR = "<!-- blip-triage:mirror "
 MISSING_TEXT = {
     "version": "the **Blip version** (Settings → Updates shows it, e.g. `0.90 · cde0eda9`)",
     "macos": "your **macOS version** and Mac model",
@@ -50,7 +57,7 @@ STOPWORDS = set(
 
 
 def log(msg):
-    print(msg, file=sys.stderr)
+    print(msg, file=sys.stderr, flush=True)
 
 
 # --------------------------------------------------------------------- GitHub
@@ -61,7 +68,7 @@ class GitHub:
         self.repo, self.token = repo, token
 
     def call(self, method, path, body=None, query=None):
-        url = f"https://api.github.com{path}"
+        url = path if path.startswith("https://") else f"https://api.github.com{path}"
         if query:
             url += "?" + urllib.parse.urlencode(query)
         data = json.dumps(body).encode() if body is not None else None
@@ -69,6 +76,7 @@ class GitHub:
         req.add_header("Authorization", f"Bearer {self.token}")
         req.add_header("Accept", "application/vnd.github+json")
         req.add_header("X-GitHub-Api-Version", "2022-11-28")
+        req.add_header("User-Agent", "blip-triage")
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:
@@ -83,6 +91,9 @@ class GitHub:
     def r(self, suffix=""):
         return f"/repos/{self.repo}{suffix}"
 
+    def login(self):
+        return self.call("GET", "/user")["login"]
+
     def labels(self):
         out = self.call("GET", self.r("/labels"), query={"per_page": 100})
         return [l["name"] for l in out]
@@ -90,49 +101,49 @@ class GitHub:
     def comments(self, number):
         return self.call("GET", self.r(f"/issues/{number}/comments"), query={"per_page": 100})
 
+    def updated_since(self, since):
+        page, out = 1, []
+        while True:
+            batch = self.call("GET", self.r("/issues"), query={
+                "state": "all", "since": since, "sort": "updated", "direction": "asc",
+                "per_page": 100, "page": page,
+            })
+            out += [i for i in batch if "pull_request" not in i]
+            if len(batch) < 100:
+                return out
+            page += 1
+
     def search(self, terms, exclude):
         q = f"repo:{self.repo} is:issue " + " ".join(terms)
         out = self.call("GET", "/search/issues", query={"q": q, "per_page": 10})
         return [i for i in out.get("items", []) if i["number"] != exclude and "pull_request" not in i]
 
-    def runs_today(self, workflow):
-        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        out = self.call(
-            "GET", self.r(f"/actions/workflows/{workflow}/runs"),
-            query={"created": f">={day}", "per_page": 1},
-        )
-        return out.get("total_count", 0)
-
 
 # ---------------------------------------------------------------------- Model
 
 
-def tool_schema(area_labels, candidate_numbers):
+def schema(area_labels):
     return {
-        "name": "triage",
-        "description": "Record the triage decision for this issue.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "kind": {"type": "string", "enum": list(KINDS) + ["spam"]},
-                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-                "areas": {"type": "array", "items": {"type": "string", "enum": area_labels or ["none"]}, "maxItems": 2},
-                "missing": {"type": "array", "items": {"type": "string", "enum": list(MISSING)}},
-                "duplicates": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "number": {"type": "integer"},
-                            "confidence": {"type": "string", "enum": ["high", "medium"]},
-                        },
-                        "required": ["number", "confidence"],
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": list(KINDS) + ["spam"]},
+            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            "areas": {"type": "array", "items": {"type": "string", "enum": area_labels or ["none"]}, "maxItems": 2},
+            "missing": {"type": "array", "items": {"type": "string", "enum": list(MISSING)}},
+            "duplicates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "number": {"type": "integer"},
+                        "confidence": {"type": "string", "enum": ["high", "medium"]},
                     },
+                    "required": ["number", "confidence"],
                 },
-                "reason": {"type": "string"},
             },
-            "required": ["kind", "confidence", "areas", "missing", "duplicates", "reason"],
+            "reason": {"type": "string"},
         },
+        "required": ["kind", "confidence", "areas", "missing", "duplicates", "reason"],
     }
 
 
@@ -167,45 +178,61 @@ def user_message(issue, author_comments, area_labels, candidates):
     return "\n".join(parts)
 
 
-def ask_api(system, message, schema, model):
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        raise SystemExit("ANTHROPIC_API_KEY is not set")
+def parse_json(text):
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+    return json.loads(text)
+
+
+def think_setting(model):
+    """TRIAGE_THINK overrides. Measured on the fixtures: gpt-oss returns empty
+    content with thinking off, and qwen3 misses details given in comments
+    without it."""
+    raw = (os.environ.get("TRIAGE_THINK") or "").strip().lower()
+    if raw in ("true", "false"):
+        return raw == "true"
+    if raw in ("low", "medium", "high"):
+        return raw
+    if "gpt-oss" in model:
+        return "low"
+    return model.startswith("qwen3:")
+
+
+def ask_ollama(system, message, shape, model):
+    url = (os.environ.get("OLLAMA_URL") or "http://localhost:11434").rstrip("/") + "/api/chat"
     body = {
         "model": model,
-        "max_tokens": 600,
-        "system": system,
-        "tools": [schema],
-        "tool_choice": {"type": "tool", "name": "triage"},
-        "messages": [{"role": "user", "content": message}],
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": message}],
+        "format": shape,
+        "stream": False,
+        "think": think_setting(model),
+        "options": {"temperature": 0},
     }
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages", data=json.dumps(body).encode(), method="POST"
-    )
-    req.add_header("x-api-key", key)
-    req.add_header("anthropic-version", "2023-06-01")
-    req.add_header("content-type", "application/json")
+
+    def post(payload):
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            return json.loads(resp.read())
+
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            out = json.loads(resp.read())
+        out = post(body)
     except urllib.error.HTTPError as err:
-        raise SystemExit(f"Anthropic API failed: {err.code} {err.read().decode(errors='replace')[:300]}")
-    usage = out.get("usage", {})
-    log(f"model={model} input_tokens={usage.get('input_tokens')} output_tokens={usage.get('output_tokens')}")
-    for block in out.get("content", []):
-        if block.get("type") == "tool_use" and block.get("name") == "triage":
-            return block["input"]
-    raise SystemExit("model returned no triage call")
+        detail = err.read().decode(errors="replace")[:300]
+        if "think" not in detail:
+            raise SystemExit(f"Ollama failed: {err.code} {detail}")
+        body.pop("think")  # a model without a thinking switch rejects the field
+        out = post(body)
+    except urllib.error.URLError as err:
+        raise SystemExit(f"Ollama is not reachable at {url}: {err.reason}")
+    secs = (out.get("total_duration") or 0) / 1e9
+    log(f"model={model} prompt_tokens={out.get('prompt_eval_count')} output_tokens={out.get('eval_count')} seconds={secs:.1f}")
+    return parse_json(out["message"]["content"])
 
 
-def ask_claude_cli(system, message, schema, model):
+def ask_claude_cli(system, message, shape, model):
     """Local dry runs only: the same prompt through the Claude Code CLI."""
-    system = (
-        system
-        + "\n\nThere is no tool in this session. Instead reply with ONLY a JSON object"
-        + " (no prose, no code fence) matching this JSON Schema:\n"
-        + json.dumps(schema["input_schema"])
-    )
+    system += "\n\nReply with ONLY a JSON object (no prose, no code fence) matching this JSON Schema:\n" + json.dumps(shape)
     out = subprocess.run(
         ["claude", "-p", "--model", model, "--system-prompt", system, "--tools", "",
          "--output-format", "json", "--no-session-persistence", "--max-turns", "1"],
@@ -213,11 +240,10 @@ def ask_claude_cli(system, message, schema, model):
     )
     if out.returncode != 0:
         raise SystemExit(f"claude CLI failed: {out.stderr[:300]}")
-    result = json.loads(out.stdout)
-    log(f"model={model} cost_usd={result.get('total_cost_usd')}")
-    text = result.get("result", "").strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
-    return json.loads(text)
+    return parse_json(json.loads(out.stdout).get("result", ""))
+
+
+ENGINES = {"ollama": ask_ollama, "claude-cli": ask_claude_cli}
 
 
 # --------------------------------------------------------------------- Policy
@@ -245,18 +271,24 @@ def find_candidates(gh, issue):
     return list(found.values())[:8]
 
 
-def plan(event_name, event, decision, repo_labels, comments, candidates):
+def is_ours(comment, bot_login):
+    user = comment.get("user") or {}
+    return user.get("type") == "Bot" or (bot_login and user.get("login") == bot_login)
+
+
+def plan(event_name, event, decision, repo_labels, comments, candidates, bot_login=None):
     """Turn a decision into a list of actions. Pure: no network."""
     issue = event["issue"]
     have = {l["name"] for l in issue.get("labels", [])}
-    bot_bodies = [c.get("body") or "" for c in comments if (c.get("user") or {}).get("type") == "Bot"]
-    asked_before = any(MARK_NEEDS_INFO in b for b in bot_bodies)
-    duped_before = any(MARK_DUPLICATES in b for b in bot_bodies)
+    ours = [c.get("body") or "" for c in comments if is_ours(c, bot_login)]
+    asked_before = any(MARK_NEEDS_INFO in b for b in ours)
+    duped_before = any(MARK_DUPLICATES in b for b in ours)
     area_labels = [l for l in repo_labels if l.startswith("area/")]
     candidate_numbers = {c["number"] for c in candidates}
 
     kind = decision.get("kind")
     confident = decision.get("confidence") == "high"
+    reason = decision.get("reason", "")
     add, remove, sections, close = [], [], [], None
     is_bug = "bug" in have or kind == "bug"
     missing = [m for m in decision.get("missing", []) if m in MISSING] if is_bug else []
@@ -265,14 +297,14 @@ def plan(event_name, event, decision, repo_labels, comments, candidates):
         # The author replied while needs-info is on: only decide whether to lift it.
         if "needs-info" in have and not missing:
             remove.append("needs-info")
-        return {"add": add, "remove": remove, "comment": None, "close": None, "reason": decision.get("reason", "")}
+        return {"add": add, "remove": remove, "comment": None, "close": None, "reason": reason}
 
     if kind == "spam":
         insider = issue.get("author_association") in INSIDERS
         if confident and not insider and event["action"] == "opened" and "wontfix" in repo_labels:
             add.append("wontfix")
             close = "not_planned"
-        return {"add": add, "remove": remove, "comment": None, "close": close, "reason": decision.get("reason", "")}
+        return {"add": add, "remove": remove, "comment": None, "close": close, "reason": reason}
 
     if kind in KINDS and not have & set(KINDS) and kind in repo_labels:
         add.append(kind)
@@ -281,7 +313,11 @@ def plan(event_name, event, decision, repo_labels, comments, candidates):
             add.append(a)
 
     dupes = [d for d in decision.get("duplicates", []) if d.get("number") in candidate_numbers]
-    if any(d["confidence"] == "high" for d in dupes) and "duplicate" not in have and "duplicate" in repo_labels:
+    # Only an open match earns the label: a closed one may be fixed, and a
+    # report against a newer version is a regression, not a duplicate.
+    open_numbers = {c["number"] for c in candidates if c.get("state") == "open"}
+    certain = [d for d in dupes if d["confidence"] == "high" and d["number"] in open_numbers]
+    if certain and "duplicate" not in have and "duplicate" in repo_labels:
         add.append("duplicate")
     if dupes and not duped_before:
         lines = "\n".join(f"- #{d['number']}" for d in dupes[:3])
@@ -306,12 +342,12 @@ def plan(event_name, event, decision, repo_labels, comments, candidates):
     comment = None
     if sections:
         comment = "\n\n---\n\n".join(sections) + "\n\n<sub>Automated triage — a person reads every issue.</sub>"
-    return {"add": add, "remove": remove, "comment": comment, "close": close, "reason": decision.get("reason", "")}
+    return {"add": add, "remove": remove, "comment": comment, "close": close, "reason": reason}
 
 
 def guard(text):
     """Refuse to post anything that could carry a credential."""
-    for name in ("ANTHROPIC_API_KEY", "GITHUB_TOKEN"):
+    for name in ("GH_TOKEN", "MIRROR_TOKEN"):
         val = os.environ.get(name)
         if val and val in text:
             raise SystemExit("refusing to post: comment contains a secret")
@@ -331,60 +367,168 @@ def apply(gh, number, actions):
         gh.call("PATCH", gh.r(f"/issues/{number}"), {"state": "closed", "state_reason": actions["close"]})
 
 
+def triage(event_name, event, repo_labels, comments, candidates, ask, model, bot_login=None):
+    issue = event["issue"]
+    author = (issue.get("user") or {}).get("login")
+    author_comments = [
+        c.get("body") or "" for c in comments
+        if (c.get("user") or {}).get("login") == author and not is_ours_marked(c)
+    ]
+    area_labels = [l for l in repo_labels if l.startswith("area/")]
+    system = (HERE / "prompt.md").read_text()
+    message = user_message(issue, author_comments, area_labels, candidates)
+    decision = ask(system, message, schema(area_labels), model)
+    return decision, plan(event_name, event, decision, repo_labels, comments, candidates, bot_login)
+
+
+def is_ours_marked(comment):
+    body = comment.get("body") or ""
+    return MARK_NEEDS_INFO in body or MARK_DUPLICATES in body
+
+
+# --------------------------------------------------------------------- Mirror
+
+
+def mirror(gh, issue, state_entry, dry_run):
+    """Open a linked issue in the private tracker once an issue is `accepted`.
+
+    Inert unless MIRROR_TOKEN and MIRROR_REPO are both set. Nothing is posted
+    back to the public issue.
+    """
+    token, target = os.environ.get("MIRROR_TOKEN"), os.environ.get("MIRROR_REPO")
+    if not (token and target) or state_entry.get("mirrored"):
+        return
+    priv = GitHub(target, token)
+    marker = f"{MARK_MIRROR}{gh.repo}#{issue['number']} -->"
+    found = priv.call("GET", "/search/issues", query={"q": f'repo:{target} is:issue in:body "{gh.repo}#{issue["number"]}"'})
+    if any(marker in (i.get("body") or "") for i in found.get("items", [])):
+        state_entry["mirrored"] = True
+        return
+    body = f"{marker}\nMirrored from the public board: {issue['html_url']}\n\n---\n\n{issue.get('body') or ''}"
+    log(f"#{issue['number']}: mirroring to the private tracker")
+    if not dry_run:
+        priv.call("POST", priv.r("/issues"), {"title": issue["title"], "body": body})
+        state_entry["mirrored"] = True
+
+
+# ----------------------------------------------------------------------- Poll
+
+
+def state_path():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "blip-triage" / "state.json"
+
+
+def load_state(path):
+    if path.exists():
+        return json.loads(path.read_text())
+    return {"since": None, "issues": {}, "day": None, "calls": 0}
+
+
+def save_state(path, state):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def content_hash(issue):
+    return hashlib.sha256(f"{issue.get('title')}\0{issue.get('body')}".encode()).hexdigest()[:16]
+
+
+def poll(args, ask):
+    token = os.environ.get("GH_TOKEN")
+    if not token:
+        raise SystemExit("GH_TOKEN is not set")
+    gh = GitHub(args.repo, token)
+    path = state_path()
+    state = load_state(path)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if state.get("day") != today:
+        state["day"], state["calls"] = today, 0
+    limit = int(os.environ.get("TRIAGE_DAILY_LIMIT") or 40)
+    since = state.get("since") or (datetime.now(timezone.utc) - timedelta(days=args.lookback_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    issues = gh.updated_since(since)
+    log(f"{len(issues)} issue(s) updated since {since}")
+    if not issues:
+        return
+    bot_login, repo_labels = gh.login(), gh.labels()
+
+    for issue in issues:
+        key = str(issue["number"])
+        entry = state["issues"].setdefault(key, {})
+        have = {l["name"] for l in issue.get("labels", [])}
+        if "accepted" in have:
+            mirror(gh, issue, entry, args.dry_run)
+
+        # Work out which events this issue has had since we last handled it.
+        event_name = None
+        h = content_hash(issue)
+        comments = gh.comments(issue["number"]) if issue.get("comments") else []
+        author = (issue.get("user") or {}).get("login")
+        replies = [c for c in comments if (c.get("user") or {}).get("login") == author and not is_ours_marked(c)]
+        last_reply = max((c["id"] for c in replies), default=0)
+        if "hash" not in entry:
+            event_name, action = "issues", "opened"
+        elif entry["hash"] != h:
+            event_name, action = "issues", "edited"
+        elif last_reply > entry.get("last_reply", 0) and "needs-info" in have:
+            event_name, action = "issue_comment", "created"
+
+        if event_name and issue["state"] == "open" and "triaged" not in have:
+            if state["calls"] >= limit:
+                log(f"daily limit reached ({limit} model calls); stopping until tomorrow")
+                break
+            state["calls"] += 1
+            event = {"action": action, "issue": issue}
+            candidates = find_candidates(gh, issue) if event_name == "issues" else []
+            decision, actions = triage(event_name, event, repo_labels, comments, candidates, ask, args.model, bot_login)
+            print(json.dumps({"issue": issue["number"], "event": f"{event_name}.{action}",
+                              "decision": decision, "actions": actions}, ensure_ascii=False), flush=True)
+            if not args.dry_run:
+                apply(gh, issue["number"], actions)
+
+        if not args.dry_run:
+            entry["hash"], entry["last_reply"] = h, last_reply
+            state["since"] = max(state.get("since") or "", issue["updated_at"])
+            save_state(path, state)  # after each issue, so a crash never repeats a comment
+
+    if not args.dry_run:
+        save_state(path, state)
+
+
 # ----------------------------------------------------------------------- Main
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("command", nargs="?", choices=["poll"], help="poll the repository (the timer runs this)")
+    ap.add_argument("--repo", help="OWNER/NAME to poll")
     ap.add_argument("--fixture", help="offline dry run from a fixture JSON")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, change nothing")
-    ap.add_argument("--engine", choices=["api", "claude-cli"], default="api")
-    ap.add_argument("--model", default=os.environ.get("TRIAGE_MODEL") or "claude-haiku-5-5")
+    ap.add_argument("--engine", choices=sorted(ENGINES), default=os.environ.get("TRIAGE_ENGINE") or "ollama")
+    ap.add_argument("--model", default=os.environ.get("TRIAGE_MODEL") or "gpt-oss:20b")
+    ap.add_argument("--lookback-days", type=int, default=7, help="first poll only: how far back to look")
     args = ap.parse_args()
+    ask = ENGINES[args.engine]
 
-    if args.fixture:
-        fx = json.loads(Path(args.fixture).read_text())
-        event_name, event = fx["event_name"], fx["event"]
-        repo_labels, comments, candidates, gh = fx["labels"], fx.get("comments", []), fx.get("candidates", []), None
-        args.dry_run = True
-    else:
-        event_name = os.environ["GITHUB_EVENT_NAME"]
-        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-        gh = GitHub(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_TOKEN"])
+    if args.command == "poll":
+        if not args.repo:
+            ap.error("poll needs --repo OWNER/NAME")
+        return poll(args, ask)
+    if not args.fixture:
+        ap.error("give a command (poll) or --fixture")
 
+    fx = json.loads(Path(args.fixture).read_text())
+    event = fx["event"]
     issue = event["issue"]
     have = {l["name"] for l in issue.get("labels", [])}
-    if "pull_request" in issue or issue.get("state") != "open":
-        return log("not an open issue; nothing to do")
-    if "triaged" in have:
-        return log("a person has triaged this issue; leaving it alone")
-    if event_name == "issue_comment":
-        author = (issue.get("user") or {}).get("login")
-        if (event["comment"].get("user") or {}).get("login") != author or "needs-info" not in have:
-            return log("comment is not the author answering needs-info; nothing to do")
-
-    if gh:
-        limit = int(os.environ.get("TRIAGE_DAILY_LIMIT") or 40)
-        used = gh.runs_today("triage.yml")
-        if used > limit:
-            return log(f"daily limit reached ({used} runs today, limit {limit}); skipping")
-        repo_labels = gh.labels()
-        comments = gh.comments(issue["number"])
-        candidates = find_candidates(gh, issue) if event_name == "issues" else []
-
-    author = (issue.get("user") or {}).get("login")
-    author_comments = [c.get("body") or "" for c in comments if (c.get("user") or {}).get("login") == author]
-    area_labels = [l for l in repo_labels if l.startswith("area/")]
-    system = (HERE / "prompt.md").read_text()
-    message = user_message(issue, author_comments, area_labels, candidates)
-    schema = tool_schema(area_labels, [c["number"] for c in candidates])
-    ask = ask_api if args.engine == "api" else ask_claude_cli
-    decision = ask(system, message, schema, args.model)
-    actions = plan(event_name, event, decision, repo_labels, comments, candidates)
-
+    if issue.get("state") != "open" or "triaged" in have:
+        return log("closed or already triaged; nothing to do")
+    decision, actions = triage(fx["event_name"], event, fx["labels"], fx.get("comments", []),
+                               fx.get("candidates", []), ask, args.model)
     print(json.dumps({"issue": issue["number"], "decision": decision, "actions": actions}, indent=2, ensure_ascii=False))
-    if not args.dry_run:
-        apply(gh, issue["number"], actions)
 
 
 if __name__ == "__main__":
