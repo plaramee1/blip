@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in Blip doesn't work the way it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. **Issues are public** — don't paste API keys, tokens, private memories or file contents.
+        Using **Help ▸ Report a Bug…** in Blip fills in the version fields for you.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open …
+        2. Click …
+        3. See …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Blip version
+      description: Settings → Updates shows it, e.g. 0.90 · cde0eda9
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and Mac
+      placeholder: macOS 27.0 · MacBook Pro M4
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Agent backend (if it matters)
+      options:
+        - Not related to an agent
+        - Claude Code
+        - Codex
+        - Cursor
+        - Grok
+        - OpenRouter
+        - Local model (Ollama)
+        - Apple Intelligence
+        - Other HTTP provider
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshots or logs
+      description: Drag images in here. Check them for private information first.

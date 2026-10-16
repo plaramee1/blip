@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest something Blip should do.
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: Search the existing issues first — a 👍 on a matching request counts.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The problem or the workflow, not only the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+      description: How you imagine it working.
+  - type: input
+    id: version
+    attributes:
+      label: Blip version
+      placeholder: e.g. 0.90
