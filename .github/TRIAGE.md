@@ -41,6 +41,28 @@ nothing here. It is off unless `MIRROR_TOKEN` and `MIRROR_REPO` are both set in
 the env file. It lives in the poller rather than a workflow so that the token
 for the private tracker never has to be stored in this public repository.
 
+## Saying when a fix ships
+
+On every poll, for each mirrored issue not yet marked fixed, the poller asks
+the private tracker how its linked issue was closed. Once it was closed as
+completed by a merged pull request (or a commit), and a **published** release
+of this repository has a tag whose history in the private repository contains
+that merge commit, the poller comments once — `Fixed in vX.Y`, linking the
+release — and adds `fixed`. Release tags are the same in both repositories;
+drafts and pre-releases do not count, and releases published before the merge
+are not checked.
+
+It never comments twice: the comment carries a hidden marker, so a lost state
+file changes nothing, and an issue a person has already labelled `fixed` is
+left alone. While public releases are held (`BLIP_PUBLISH_PUBLIC` unset in the
+release script) there is no release here, so nothing is posted. Setting
+`FIXED_ALLOW_PRIVATE=1` lets the private tracker's own release count in the
+meantime; the comment then names the version without a link, since the
+private release page is not visible to the reporter.
+
+Needs `MIRROR_TOKEN` to also have **Contents: Read** on the private tracker
+(for the tag comparison). Nothing is written to the private tracker.
+
 ## Install on the polling machine
 
 Needs Python 3 (standard library only), Ollama running as a user service on
@@ -81,8 +103,9 @@ back 7 days; delete the state file to start over.
 | `TRIAGE_THINK` | no | `true`/`false`/`low`/`medium`/`high`. Default `low` for gpt-oss, on for `qwen3:*`, off otherwise. |
 | `OLLAMA_URL` | no | Default `http://localhost:11434`. |
 | `TRIAGE_DAILY_LIMIT` | no | Model calls per UTC day. Default `40`. |
-| `MIRROR_TOKEN` | no | Fine-grained token, **the private tracker only**, Issues: Read and write. |
+| `MIRROR_TOKEN` | no | Fine-grained token, **the private tracker only**, Issues: Read and write, Contents: Read. |
 | `MIRROR_REPO` | no | `owner/name` of the private tracker. |
+| `FIXED_ALLOW_PRIVATE` | no | `1` to post `Fixed in vX.Y` from a private release while no public one carries the tag. Default off. |
 
 ### Choosing the model
 
@@ -98,9 +121,18 @@ Measured on the fixtures below (local GPU, temperature 0):
 ## Trying it on the fixtures
 
 `triage/fixtures/` holds synthetic events. A fixture run prints the decision
-and the planned actions and never touches GitHub:
+and the planned actions and never touches GitHub (`5-` to `8-` are the
+`Fixed in` cases and need no model):
 
 ```sh
 python3 .github/triage/triage.py --fixture .github/triage/fixtures/1-bug-missing-info.json
 python3 .github/triage/triage.py --fixture .github/triage/fixtures/1-bug-missing-info.json --engine claude-cli
 ```
+
+## Tests
+
+```sh
+python3 -m unittest discover -s .github/triage
+```
+
+Offline: GitHub is a fake that answers from the fixtures.
